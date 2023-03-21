@@ -163,6 +163,75 @@ func extrapolatedRate(vals []parser.Value, args parser.Expressions, enh *EvalNod
 	})
 }
 
+// XRATE-PATCH BEGIN
+// extendedRate is a utility function for xrate/xincrease/xdelta.
+// It calculates the rate (allowing for counter resets if isCounter is true),
+// taking into account the last sample before the range start, and returns
+// the result as either per-second (if isRate is true) or overall.
+func extendedRate(vals []parser.Value, args parser.Expressions, enh *EvalNodeHelper, isCounter, isRate bool) Vector {
+	ms := args[0].(*parser.MatrixSelector)
+	vs := ms.VectorSelector.(*parser.VectorSelector)
+
+	var (
+		samples    = vals[0].(Matrix)[0]
+		rangeStart = enh.Ts - durationMilliseconds(ms.Range+vs.Offset)
+		rangeEnd   = enh.Ts - durationMilliseconds(vs.Offset)
+	)
+
+	points := samples.Points
+	if len(points) < 2 {
+		return enh.Out
+	}
+	sampledRange := float64(points[len(points)-1].T - points[0].T)
+	averageInterval := sampledRange / float64(len(points)-1)
+
+	firstPoint := 0
+	// If the point before the range is too far from rangeStart, drop it.
+	if float64(rangeStart-points[0].T) > averageInterval {
+		if len(points) < 3 {
+			return enh.Out
+		}
+		firstPoint = 1
+		sampledRange = float64(points[len(points)-1].T - points[1].T)
+		averageInterval = sampledRange / float64(len(points)-2)
+	}
+
+	var (
+		counterCorrection float64
+		lastValue         float64
+	)
+	if isCounter {
+		for i := firstPoint; i < len(points); i++ {
+			sample := points[i]
+			if sample.V < lastValue {
+				counterCorrection += lastValue
+			}
+			lastValue = sample.V
+		}
+	}
+	resultValue := points[len(points)-1].V - points[firstPoint].V + counterCorrection
+
+	// Duration between last sample and boundary of range.
+	durationToEnd := float64(rangeEnd - points[len(points)-1].T)
+
+	// If the points cover the whole range (i.e. they start just before the
+	// range start and end just before the range end) adjust the value from
+	// the sampled range to the requested range.
+	if points[firstPoint].T <= rangeStart && durationToEnd < averageInterval {
+		adjustToRange := float64(durationMilliseconds(ms.Range))
+		resultValue = resultValue * (adjustToRange / sampledRange)
+	}
+
+	if isRate {
+		resultValue = resultValue / ms.Range.Seconds()
+	}
+
+	return append(enh.Out, Sample{
+		Point: Point{V: resultValue},
+	})
+}
+// XRATE-PATCH END
+
 // histogramRate is a helper function for extrapolatedRate. It requires
 // points[0] to be a histogram. It returns nil if any other Point in points is
 // not a histogram.
@@ -228,6 +297,23 @@ func funcRate(vals []parser.Value, args parser.Expressions, enh *EvalNodeHelper)
 func funcIncrease(vals []parser.Value, args parser.Expressions, enh *EvalNodeHelper) Vector {
 	return extrapolatedRate(vals, args, enh, true, false)
 }
+
+// XRATE-PATCH BEGIN
+// === xdelta(Matrix parser.ValueTypeMatrix) Vector ===
+func funcXdelta(vals []parser.Value, args parser.Expressions, enh *EvalNodeHelper) Vector {
+	return extendedRate(vals, args, enh, false, false)
+}
+
+// === xrate(node parser.ValueTypeMatrix) Vector ===
+func funcXrate(vals []parser.Value, args parser.Expressions, enh *EvalNodeHelper) Vector {
+	return extendedRate(vals, args, enh, true, true)
+}
+
+// === xincrease(node parser.ValueTypeMatrix) Vector ===
+func funcXincrease(vals []parser.Value, args parser.Expressions, enh *EvalNodeHelper) Vector {
+	return extendedRate(vals, args, enh, true, false)
+}
+// XRATE-PATCH END
 
 // === irate(node parser.ValueTypeMatrix) Vector ===
 func funcIrate(vals []parser.Value, args parser.Expressions, enh *EvalNodeHelper) Vector {
@@ -1307,6 +1393,9 @@ var FunctionCalls = map[string]FunctionCall{
 	"time":               funcTime,
 	"timestamp":          funcTimestamp,
 	"vector":             funcVector,
+  "xdelta":             funcXdelta,
+  "xincrease":          funcXincrease,
+  "xrate":              funcXrate,
 	"year":               funcYear,
 }
 
